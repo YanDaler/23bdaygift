@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Webcam SIFT Detector (Faster Response)</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      /* Style for the camera container to manage absolute positioning */
+      .camera-container {
+        position: relative;
+        width: 100%;
+        height: auto;
+        border-radius: 0.75rem; /* rounded-xl */
+        box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1),
+          0 4px 6px -2px rgba(0, 0, 0, 0.05); /* shadow-xl */
+        overflow: hidden; /* Ensure box doesn't spill out */
+      }
+      /* Video feed takes up the full space of the container */
+      #camera {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+      /* The bounding box canvas overlays the video feed */
+      #boundingBoxCanvas {
+        position: absolute;
+        top: 0;
+        left: 0;
+        z-index: 10; /* Ensure it is on top of the video */
+        pointer-events: none; /* Allows clicks to pass through to elements beneath */
+      }
+      /* Style for the matched image column */
+      #matchedImageDisplay {
+        width: 100%;
+        height: auto;
+        max-height: 70vh;
+        object-fit: contain;
+        border-radius: 0.75rem;
+      }
+      .status-panel {
+        min-height: 4rem;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 0.75rem;
+        margin-bottom: 1.5rem;
+        transition: background-color 0.5s ease;
+      }
+    </style>
+  </head>
+  <body class="bg-gray-50 font-sans p-4 md:p-8">
+    <div class="max-w-7xl mx-auto">
+      <h1 class="text-3xl font-extrabold text-gray-800 mb-6 border-b pb-2">
+        SIFT Detector with Faster & Accurate Detection
+      </h1>
+
+      <!-- Status Panel -->
+      <div
+        id="statusPanel"
+        class="status-panel bg-blue-100 text-blue-800 font-semibold shadow-lg"
+      >
+        <p id="statusText">
+          Initializing Camera and connecting to optimized detection backend...
+        </p>
+      </div>
+
+      <!-- Main Content Grid -->
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <!-- Camera Feed Column (with Bounding Box Overlay) -->
+        <div class="bg-white p-4 rounded-xl shadow-2xl">
+          <h2 class="text-xl font-bold mb-3 text-gray-700">
+            Live Camera Feed with Detection
+          </h2>
+          <div class="camera-container bg-gray-900">
+            <!-- Video element for live feed -->
+            <video
+              id="camera"
+              autoplay
+              playsinline
+              muted
+              class="bg-gray-900"
+            ></video>
+            <!-- Bounding Box Overlay Canvas -->
+            <canvas id="boundingBoxCanvas"></canvas>
+            <!-- Hidden Canvas for capturing frames (remains hidden) -->
+            <canvas id="canvas" style="display: none"></canvas>
+          </div>
+        </div>
+
+        <!-- Matched Image Column -->
+        <div class="bg-white p-4 rounded-xl shadow-2xl">
+          <h2 class="text-xl font-bold mb-3 text-gray-700">
+            Matched Reference Image
+          </h2>
+          <div
+            id="matchedImageContainer"
+            class="relative bg-gray-200 flex items-center justify-center p-4"
+            style="min-height: 480px"
+          >
+            <!-- Image element to display the matched reference image -->
+            <img id="matchedImageDisplay" style="display: none" />
+            <!-- Placeholder text when no image is matched -->
+            <span
+              id="noMatchPlaceholder"
+              class="text-gray-500 text-lg font-medium absolute"
+              >No Confirmed Match</span
+            >
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      // --- Configuration ---
+      // ⚠️ IMPORTANT: CHANGE THIS TO YOUR RENDER URL AFTER DEPLOYMENT!
+      const API_ENDPOINT = "http://127.0.0.1:5000/match";
+      const IMAGE_FOLDER = "assets/";
+
+      // Match Stability settings
+      const CONSECUTIVE_MATCHES_REQUIRED = 3;
+
+      // Target 3.3 FPS for responsiveness
+      const DEBOUNCE_INTERVAL_MS = 300;
+
+      // UI Elements
+      const video = document.getElementById("camera");
+      const canvas = document.getElementById("canvas");
+      const ctx = canvas.getContext("2d");
+      const bboxCanvas = document.getElementById("boundingBoxCanvas");
+      const bboxCtx = bboxCanvas.getContext("2d");
+      const matchedImageDisplay = document.getElementById(
+        "matchedImageDisplay"
+      );
+      const noMatchPlaceholder = document.getElementById("noMatchPlaceholder");
+      const statusText = document.getElementById("statusText");
+      const statusPanel = document.getElementById("statusPanel");
+
+      // State Management for Temporal Smoothing
+      let matchHistory = [];
+      let confirmedMatchFilename = null;
+      let isProcessing = false;
+      let lastDrawCoords = null;
+
+      // --- Drawing Functions ---
+
+      function drawBoundingBox(coords) {
+        // Coords are [x1, y1, x2, y2, x3, y3, x4, y4]
+        bboxCtx.clearRect(0, 0, bboxCanvas.width, bboxCanvas.height);
+
+        if (!coords || coords.length !== 8) {
+          lastDrawCoords = null;
+          return;
+        }
+
+        lastDrawCoords = coords;
+
+        // Set drawing style
+        bboxCtx.strokeStyle = "#4F46E5"; // Indigo color for high visibility
+        bboxCtx.lineWidth = 4;
+        bboxCtx.lineJoin = "round";
+
+        // Draw the polygon
+        bboxCtx.beginPath();
+        bboxCtx.moveTo(coords[0], coords[1]);
+        bboxCtx.lineTo(coords[2], coords[3]);
+        bboxCtx.lineTo(coords[4], coords[5]);
+        bboxCtx.lineTo(coords[6], coords[7]);
+        bboxCtx.closePath();
+        bboxCtx.stroke();
+      }
+
+      function clearBoundingBox() {
+        bboxCtx.clearRect(0, 0, bboxCanvas.width, bboxCanvas.height);
+        lastDrawCoords = null;
+      }
+
+      // --- Utility Functions ---
+
+      function updateStatus(text, type = "info") {
+        statusText.textContent = text;
+        statusPanel.className = "status-panel shadow-lg";
+
+        if (type === "success") {
+          statusPanel.classList.add("bg-green-100", "text-green-800");
+        } else if (type === "error") {
+          statusPanel.classList.add("bg-red-100", "text-red-800");
+        } else {
+          // info
+          statusPanel.classList.add("bg-blue-100", "text-blue-800");
+        }
+      }
+
+      function displayMatch(filename, match_count, box_coords) {
+        if (confirmedMatchFilename !== filename) {
+          confirmedMatchFilename = filename;
+          // Ensure the frontend looks for the matched image in the 'assets/' folder
+          matchedImageDisplay.src = `${IMAGE_FOLDER}${filename}`;
+          matchedImageDisplay.style.display = "block";
+          noMatchPlaceholder.style.display = "none";
+        }
+        drawBoundingBox(box_coords);
+
+        updateStatus(
+          `✅ MATCH CONFIRMED: ${filename} (Homography Inliers: ${match_count})`,
+          "success"
+        );
+      }
+
+      function clearDisplay(best_sift) {
+        if (confirmedMatchFilename !== null) {
+          confirmedMatchFilename = null;
+          matchedImageDisplay.style.display = "none";
+          noMatchPlaceholder.style.display = "block";
+        }
+        clearBoundingBox();
+
+        updateStatus(`Scanning... (Highest Inliers found: ${best_sift})`);
+      }
+
+      // --- Core SIFT Processing ---
+
+      async function sendFrameForMatching() {
+        if (isProcessing) return;
+        isProcessing = true;
+
+        try {
+          // 1. Capture the frame to the hidden canvas
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+          // 2. Convert canvas to Base64 JPEG with low quality (0.4) for SPEED
+          const imageData = canvas.toDataURL("image/jpeg", 0.4);
+
+          // 3. Send to API
+          const response = await fetch(API_ENDPOINT, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ image_data: imageData }),
+          });
+
+          if (!response.ok) {
+            throw new Error(
+              `API returned status ${response.status}: ${response.statusText}`
+            );
+          }
+
+          const result = await response.json();
+
+          // 4. Update Temporal History and Drawing
+          handleMatchResult(result);
+        } catch (error) {
+          updateStatus(
+            `Error communicating with backend: ${error.message}. Check console.`,
+            "error"
+          );
+          console.error("API Communication Error:", error);
+        } finally {
+          isProcessing = false;
+        }
+      }
+
+      function handleMatchResult(result) {
+        const currentMatch = result.match;
+        const match_count = result.confidence || 0;
+        const box_coords = result.box_coords;
+
+        // Add the current detection result to a short history
+        matchHistory.push(currentMatch);
+        if (matchHistory.length > CONSECUTIVE_MATCHES_REQUIRED) {
+          matchHistory.shift(); // Keep the history size fixed
+        }
+
+        // Count occurrences in the history
+        const counts = matchHistory.reduce((acc, match) => {
+          const key = match === null ? "null" : match;
+          acc[key] = (acc[key] || 0) + 1;
+          return acc;
+        }, {});
+
+        let bestMatch = null;
+        let maxCount = 0;
+
+        for (const key in counts) {
+          if (counts[key] > maxCount) {
+            maxCount = counts[key];
+            bestMatch = key === "null" ? null : key;
+          }
+        }
+
+        // Check if the best match has been stable enough (temporal smoothing)
+        if (maxCount >= CONSECUTIVE_MATCHES_REQUIRED) {
+          if (bestMatch) {
+            displayMatch(bestMatch, match_count, box_coords);
+          } else {
+            clearDisplay(match_count);
+          }
+        } else {
+          // If not stable, show the highest detected confidence and potentially a temporary box
+          const currentStatusText = currentMatch
+            ? `Potential Match: ${currentMatch} (Inliers: ${match_count}) - Hold Steady`
+            : `Scanning... (Highest Inliers found: ${match_count})`;
+
+          updateStatus(currentStatusText);
+
+          if (currentMatch && box_coords) {
+            drawBoundingBox(box_coords);
+          } else if (!currentMatch) {
+            clearBoundingBox();
+          }
+        }
+      }
+
+      // --- Initialization ---
+
+      function resizeCanvas() {
+        // Match bounding box canvas dimensions to the video feed size
+        bboxCanvas.width = video.offsetWidth;
+        bboxCanvas.height = video.offsetHeight;
+        // Redraw the last known bounding box after resize
+        if (lastDrawCoords) {
+          drawBoundingBox(lastDrawCoords);
+        }
+      }
+
+      async function initCamera() {
+        updateStatus("Requesting camera access...");
+
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: {
+              width: { ideal: 640 },
+              height: { ideal: 480 },
+            },
+          });
+          video.srcObject = stream;
+          video.play();
+
+          video.onloadedmetadata = () => {
+            resizeCanvas();
+            window.addEventListener("resize", resizeCanvas);
+
+            updateStatus(
+              `Camera active. Starting detection loop (${
+                1000 / DEBOUNCE_INTERVAL_MS
+              } FPS)...`
+            );
+            // Start the detection loop after the video has loaded
+            setInterval(sendFrameForMatching, DEBOUNCE_INTERVAL_MS);
+          };
+        } catch (err) {
+          updateStatus(
+            "ERROR: Could not access camera. Ensure permissions are granted.",
+            "error"
+          );
+          console.error("Camera access failed:", err);
+        }
+      }
+
+      window.onload = initCamera;
+    </script>
+  </body>
+</html>

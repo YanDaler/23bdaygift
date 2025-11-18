@@ -1,0 +1,19 @@
+# render.yaml
+# Render Blueprint for SIFT Detector API
+
+services:
+  - type: web
+    name: sift-detector-api
+    env: python
+    # Defines the command to run the production server (Gunicorn)
+    startCommand: gunicorn --bind 0.0.0.0:$PORT app:app --workers 1
+    plan: standard # Recommended: Use 'standard' or higher for CV workloads
+    buildCommand: "pip install -r requirements.txt"
+    # Port 5000 is the default for Flask, but Render uses its own $PORT
+    port: 5000
+    # Add a health check path for monitoring
+    healthCheckPath: /
+    # Auto-deploy when changes are pushed to your Git repository
+    autoDeploy: true
+# NOTE: The 'standard' plan offers more CPU/RAM, which is crucial
+# for OpenCV/SIFT processing. The 'starter' plan may time out.
