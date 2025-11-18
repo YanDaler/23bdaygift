@@ -21,4 +21,4 @@ services:
 # for OpenCV/SIFT processing. The 'starter' plan may time out.
 
 
-This version of `render.yaml` should be accepted by the Render blueprint system without any field errors. Good luck with your deployment!
+
